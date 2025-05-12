@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import os
 import sys
+import time
 
 from call_connection_manager import CallConfigManager, SessionManager
 from dotenv import load_dotenv
@@ -34,6 +35,20 @@ logger.add(sys.stderr, level="DEBUG")
 daily_api_key = os.getenv("DAILY_API_KEY", "")
 daily_api_url = os.getenv("DAILY_API_URL", "https://api.daily.co/v1")
 
+# Global call stats tracker
+class CallStats:
+    def __init__(self):
+        self.start_time = time.time()
+        self.silence_events = 0
+        self.unanswered_prompts = 0
+        self.max_unanswered = 3
+
+    def log_summary(self):
+        duration = time.time() - self.start_time
+        logger.info("=== Call Summary ===")
+        logger.info(f"Duration: {duration:.1f} seconds")
+        logger.info(f"Silence events: {self.silence_events}")
+        logger.info(f"Unanswered prompts: {self.unanswered_prompts}")
 
 async def main(
     room_url: str,
@@ -41,7 +56,7 @@ async def main(
     body: dict,
 ):
     # ------------ CONFIGURATION AND SETUP ------------
-
+    call_stats = CallStats()
     # Create a config manager using the provided body
     call_config_manager = CallConfigManager.from_json_string(body) if body else CallConfigManager()
 
@@ -104,7 +119,7 @@ async def main(
         if session_manager:
             # Mark that the call was terminated by the bot
             session_manager.call_flow_state.set_call_terminated()
-
+        call_stats.log_summary()
         # Then end the call
         await params.llm.queue_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
 
@@ -155,12 +170,32 @@ async def main(
     task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
 
     # ------------ EVENT HANDLERS ------------
+    async def monitor_silence(transport, participant_id):
+        while call_stats.unanswered_prompts < call_stats.max_unanswered:
+            # Check every 10 seconds for silence
+            await asyncio.sleep(10)
+            vad = transport.vad_analyzer.get_activity(participant_id)
+            if vad == "silence":
+                call_stats.silence_events += 1
+                call_stats.unanswered_prompts += 1
+                logger.info(f"Silence detected ({call_stats.unanswered_prompts}/{call_stats.max_unanswered})")
+                await transport.say("Are you still there?")
+            else:
+                call_stats.unanswered_prompts = 0  # reset if user speaks
+
+        # Exceeded max unanswered, terminate
+        logger.info("Max unanswered prompts reached, terminating call.")
+        await transport.say("No response detected, ending the call now. Goodbye!")
+        call_stats.log_summary()
+        await transport.hangup()
 
     @transport.event_handler("on_first_participant_joined")
     async def on_first_participant_joined(transport, participant):
         logger.debug(f"First participant joined: {participant['id']}")
         await transport.capture_participant_transcription(participant["id"])
         await task.queue_frames([context_aggregator.user().get_context_frame()])
+        # Start silence monitoring coroutine
+        asyncio.create_task(monitor_silence(transport, participant["id"]))
 
     @transport.event_handler("on_participant_left")
     async def on_participant_left(transport, participant, reason):
